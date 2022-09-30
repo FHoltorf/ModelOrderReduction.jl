@@ -196,3 +196,16 @@ function computeSP2(pc::MultiOrthoPoly)
     multi_SP2 = [prod(uni_SP2[j][pc.ind[i, j] + 1] for j in 1:n) for i in 1:m]
     return multi_SP2
 end
+
+
+# find rows
+function find_multi_index(mult_index::AbstractVector{<:Int}, pce::MultiOrthoPoly)
+    index = 0
+    for i in axes(pce.ind,1)
+        if all(mult_index .== pce.ind[i,:])
+            index = i
+            break
+        end
+    end
+    return index
+end

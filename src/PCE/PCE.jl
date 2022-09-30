@@ -1,12 +1,12 @@
 using PolyChaos, Symbolics, ModelingToolkit, LinearAlgebra
 
-export PCE, moment_equations, pce_galerkin, mean, var
+export PCE, SparsePCE, moment_equations, pce_galerkin
 
 include("PCE_utils.jl")
-# for now only consider tensor grid bases
-# with degree equal across all bases
-# need to adjust in PolyChaos
-struct PCE
+
+abstract type AbstractPCE end
+
+struct PCE <: AbstractPCE
     states::Any # states
     parameters::Any # vector of parameters being expanded
     bases::Any # vector of pairs: p (symbolic variable) => polynomial basis (PolyChaos)
@@ -38,8 +38,8 @@ function PCE(states, bases::AbstractVector{<:Pair})
     @variables ζ(parameters...)[1:n_basis]
     sym_basis = collect(ζ)
 
-    sym_to_pc = Dict(ζ[i] => pc_basis.ind[i, :] for i in eachindex(ζ))
-    pc_to_sym = Dict(val => key for (val, key) in sym_to_pc)
+    sym_to_pc = Dict(ζ[i] => i for i in eachindex(ζ))
+    pc_to_sym = Dict(pc_basis.ind[i,:] => ζ[i] for i in eachindex(ζ))
 
     moments = []
     for (i, state) in enumerate(collect(states))
@@ -69,6 +69,99 @@ function (pce::PCE)(moment_vals, parameter_vals::AbstractVector)
     return pce(moment_vals, reshape(parameter_vals, 1, length(parameter_vals)))
 end
 function (pce::PCE)(moment_vals, parameter_vals::Number)
+    return pce(moment_vals, reshape([parameter_vals], 1, 1))
+end
+
+struct SparsePCE <: AbstractPCE
+    states::Any # states
+    parameters::Any # vector of parameters being expanded
+    bases::Any # vector of pairs: p (symbolic variable) => polynomial basis (PolyChaos)
+    bases_dict::Any # dictionary generated from bases
+    sparse_sym_basis::Any # vector of basis fxs for each state (as symbolic variable)
+    sparse_pc_basis::Any # vector of basis fxs for each state (as multi-index)
+    sym_basis::Any
+    pc_basis::Any # dense multivariate polynomial
+    sym_to_pc::Any
+    pc_to_sym::Any
+    pc_indices::Any
+    state_pc_indices::Any
+    ansatz::Any # vector of pairs: x(t,p) => ∑ᵢ cᵢ(t)ξᵢ(p)
+    moments::Any # matrix (?) of symbolic variables: cᵢ(t)
+end
+function SparsePCE(sparse_states::AbstractVector{<:Pair}, bases::AbstractVector{<:Pair})
+    bases_dict = Dict(bases)
+    parameters = [p for (p, op) in bases]
+    max_deg = maximum([deg(op) for (p,op) in bases])
+    ops = [deg(op) < max_deg ? bump_degree(op, max_deg) : op for (p, op) in bases]
+    
+    pc_basis = MultiOrthoPoly(ops, max_deg)
+
+    states = [state for (state, baxels) in sparse_states]
+    sparse_pc_basis = [baxel for (state, baxel) in sparse_states]
+    basis_fxns = union(sparse_pc_basis...)
+    
+    n_basis = length(basis_fxns)
+    @variables ζ(parameters...)[1:n_basis]
+    sym_basis = collect(ζ)
+
+    pc_to_sym = Dict(basis_fxns[i] => sym_basis[i] for i in eachindex(basis_fxns))
+    sym_to_pc = Dict(sym_basis[i] => find_multi_index(basis_fxns[i], pc_basis) for i in eachindex(basis_fxns))
+
+    sparse_sym_basis = []
+    moments = []
+    for (i, (state, baxels)) in enumerate(sparse_states)
+        push!(sparse_sym_basis, [pc_to_sym[baxel] for baxel in baxels])
+        moment_name = "z" * Symbolics.map_subscripts(i)
+        ind_vars = get_independent_vars(state)
+        sub_moments = []
+        for baxel in sparse_sym_basis[i]
+            k = get_basis_indices(baxel) .+ 1
+            submoment_name = Symbol(moment_name * Symbolics.map_subscripts(k...))
+            if isempty(ind_vars)
+                pce_coeff = @variables $(submoment_name)
+            else
+                pce_coeff = @variables $(submoment_name)(ind_vars...)
+            end
+            push!(sub_moments, pce_coeff[1])
+        end
+        push!(moments, sub_moments)
+    end
+    pc_indices = sort(collect(values(sym_to_pc)))
+    pc_dict = Dict(pc_indices[i] => i for i in eachindex(pc_indices))
+    state_pc_idcs = [zeros(Int, n_basis) for i in eachindex(states)]
+    for k in eachindex(states) 
+        idcs = [sym_to_pc[baxel] for baxel in sparse_sym_basis[k]]
+        state_pc_idcs[k][[pc_dict[idx] for idx in idcs]] .= 1 
+    end
+
+    ansatz = [states[i] => sum(moments[i][j] * sparse_sym_basis[i][j] for j in eachindex(moments[i]))
+              for i in eachindex(states)]
+    return SparsePCE(states, parameters, bases, bases_dict,
+                     sparse_sym_basis, sparse_pc_basis,
+                     sym_basis, pc_basis, 
+                     sym_to_pc, pc_to_sym, 
+                     pc_indices, state_pc_idcs, 
+                     ansatz, moments)
+end
+function (pce::SparsePCE)(moment_vals, parameter_vals::AbstractMatrix)
+    # wasteful => should implement my own version of this
+    # this evaluates each polynomial via recurrence relation from scratch
+    # can reuse many results. 
+    # fine for now. 
+    #basis = evaluate(pce.pc_indices, parameter_vals, pce.pc_basis)
+    #return [dot(moment_vals[k],basis[pce.state_pc_indices[k]]) for k in eachindex(moment_vals)]
+    val = zeros(length(pce.states))
+    for k in eachindex(pce.states)
+        idcs = reduce(vcat,pce.sparse_pc_basis[k]')
+        basis = evaluate(idcs, parameter_vals, pce.pc_basis)
+        val[k] = dot(moment_vals[k], basis)
+    end
+    return val
+end
+function (pce::SparsePCE)(moment_vals, parameter_vals::AbstractVector)
+    return pce(moment_vals, reshape(parameter_vals, 1, length(parameter_vals)))
+end
+function (pce::SparsePCE)(moment_vals, parameter_vals::Number)
     return pce(moment_vals, reshape([parameter_vals], 1, 1))
 end
 
