@@ -34,7 +34,3 @@ MO = ModelOrderReduction
     @test isapprox(x_val, x_true)
     @test isapprox(y_val, y_true)
 end
-
-@testset "SparsePCE: " begin
-    
-end
