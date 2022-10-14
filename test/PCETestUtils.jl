@@ -23,3 +23,7 @@ end
 function isapprox_sym(exprA::Symbolics.Term, exprB::Symbolics.Term, atol = 1e-6)
     return isequal(exprA, exprB)
 end
+
+function isapprox_sym(exprA::Number, exprB::Number, atol = 1e-6)
+    return isapprox(exprA, exprB, atol = atol)
+end

@@ -148,8 +148,6 @@ function (pce::SparsePCE)(moment_vals, parameter_vals::AbstractMatrix)
     # this evaluates each polynomial via recurrence relation from scratch
     # can reuse many results. 
     # fine for now. 
-    #basis = evaluate(pce.pc_indices, parameter_vals, pce.pc_basis)
-    #return [dot(moment_vals[k],basis[pce.state_pc_indices[k]]) for k in eachindex(moment_vals)]
     val = zeros(length(pce.states))
     for k in eachindex(pce.states)
         idcs = reduce(vcat,pce.sparse_pc_basis[k]')
@@ -166,12 +164,21 @@ function (pce::SparsePCE)(moment_vals, parameter_vals::Number)
 end
 
 # 1. apply PCE ansatz
-function generate_parameter_pce(pce::AbstractPCE)
+function generate_parameter_pce(pce::PCE)
     par_dim = length(pce.parameters)
     par_pce = Vector{Pair{eltype(pce.parameters), eltype(pce.sym_basis)}}(undef, par_dim)
     for (i, bases) in enumerate(pce.bases)
         p, op = bases
         par_pce[i] = p => pce.sym_basis[i + 1] + op.α[1]
+    end
+    return par_pce
+end
+function generate_parameter_pce(pce::SparsePCE)
+    par_dim = length(pce.parameters)
+    par_pce = Vector{Pair{eltype(pce.parameters), eltype(pce.sym_basis)}}(undef, par_dim)
+    for (i, bases) in enumerate(pce.bases)
+        p, op = bases
+        par_pce[i] = p => pce.pc_to_sym[[i .== k for k in 1:length(pce.bases)]] + op.α[1]
     end
     return par_pce
 end
@@ -203,7 +210,9 @@ function extract_basismonomial_coeffs(eqs::AbstractVector, pce::SparsePCE)
     basismonomial_coeffs = [extract_coeffs(eq, pce.sym_basis) for eq in eqs]
     basismonomial_indices = []
     for coeffs in basismonomial_coeffs
-        temp = [mono => pce.pc_indices[get_basis_indices(mono) .+ 1] for mono in keys(coeffs)]
+        temp = [mono => mono isa Val{1} ? 
+                        [0] :
+                        pce.pc_indices[get_basis_indices(mono) .+ 1] .- 1 for mono in keys(coeffs)]
         union!(basismonomial_indices, temp)
     end
     return basismonomial_coeffs, basismonomial_indices
@@ -213,7 +222,6 @@ end
 function maximum_degree(mono_indices::AbstractVector, pce::AbstractPCE)
     max_degree = 0
     for (mono, ind) in mono_indices
-        println(ind)
         max_degree = max(max_degree,
                          maximum(sum(pce.pc_basis.ind[ind[i]+1, :]
                                      for i in eachindex(ind))))
@@ -242,7 +250,7 @@ function eval_scalar_products(mono_indices, pce::SparsePCE)
 
     scalar_products = Dict()
     for k in pce.pc_indices
-        scalar_products[k] = Dict(mono => computeSP(vcat(ind, kpc - 1), integrator_pce)
+        scalar_products[k] = Dict(mono => computeSP(vcat(ind, k - 1), integrator_pce)
                                   for (mono, ind) in mono_indices)
     end
     return scalar_products
@@ -269,9 +277,10 @@ function galerkin_projection(bm_coeffs, scalar_products, pce::SparsePCE)
     for i in eachindex(bm_coeffs)
         eqs = []
         for k in pce.sparse_pc_basis[i]
-            scaling = computeSP(vcat(k,k), pce.pc_basis)
+            lin_idx = pce.sym_to_pc[pce.pc_to_sym[k]]
+            scaling = computeSP2(lin_idx, pce.pc_basis)
             push!(eqs,
-                  1/scaling * sum(bm_coeffs[i][mono] * scalar_products[k][mono]
+                  1/scaling * sum(bm_coeffs[i][mono] * scalar_products[lin_idx][mono]
                       for mono in keys(bm_coeffs[i])))
         end
         push!(projected_eqs, eqs)
