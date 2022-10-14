@@ -79,12 +79,12 @@ struct SparsePCE <: AbstractPCE
     bases_dict::Any # dictionary generated from bases
     sparse_sym_basis::Any # vector of basis fxs for each state (as symbolic variable)
     sparse_pc_basis::Any # vector of basis fxs for each state (as multi-index)
-    sym_basis::Any
+    sym_basis::Any # vector of symbolic variables
     pc_basis::Any # dense multivariate polynomial
-    sym_to_pc::Any
-    pc_to_sym::Any
-    pc_indices::Any
-    state_pc_indices::Any
+    sym_to_pc::Any # symbolic variable => linear index corresponding to multi-index in pc_basis
+    pc_to_sym::Any # multi-index (0-indexed) => symboic variable
+    pc_indices::Any # ordered set of linear indices corresponding to multi-indices in pc_basis
+    state_pc_indices::Any # vector of incidence vectors for which basis functions are part of a state's pce ansatz
     ansatz::Any # vector of pairs: x(t,p) => ∑ᵢ cᵢ(t)ξᵢ(p)
     moments::Any # matrix (?) of symbolic variables: cᵢ(t)
 end
@@ -126,7 +126,7 @@ function SparsePCE(sparse_states::AbstractVector{<:Pair}, bases::AbstractVector{
         end
         push!(moments, sub_moments)
     end
-    pc_indices = sort(collect(values(sym_to_pc)))
+    pc_indices = [sym_to_pc[sym_basis[i]] for i in eachindex(sym_basis)]
     pc_dict = Dict(pc_indices[i] => i for i in eachindex(pc_indices))
     state_pc_idcs = [zeros(Int, n_basis) for i in eachindex(states)]
     for k in eachindex(states) 
@@ -166,7 +166,7 @@ function (pce::SparsePCE)(moment_vals, parameter_vals::Number)
 end
 
 # 1. apply PCE ansatz
-function generate_parameter_pce(pce::PCE)
+function generate_parameter_pce(pce::AbstractPCE)
     par_dim = length(pce.parameters)
     par_pce = Vector{Pair{eltype(pce.parameters), eltype(pce.sym_basis)}}(undef, par_dim)
     for (i, bases) in enumerate(pce.bases)
@@ -175,16 +175,16 @@ function generate_parameter_pce(pce::PCE)
     end
     return par_pce
 end
-function substitute_parameters(eqs::AbstractVector, pce::PCE)
+function substitute_parameters(eqs::AbstractVector, pce::AbstractPCE)
     par_pce = generate_parameter_pce(pce)
     subs_eqs = [substitute(eq, par_pce) for eq in eqs]
     return subs_eqs
 end
-function substitute_pce_ansatz(eqs::AbstractVector, pce::PCE)
+function substitute_pce_ansatz(eqs::AbstractVector, pce::AbstractPCE)
     subs_eqs = [expand(expand(substitute(eq, pce.ansatz))) for eq in eqs]
     return subs_eqs
 end
-function apply_ansatz(eqs::AbstractVector, pce::PCE)
+function apply_ansatz(eqs::AbstractVector, pce::AbstractPCE)
     return substitute_pce_ansatz(substitute_parameters(eqs, pce), pce)
 end
 
@@ -199,12 +199,23 @@ function extract_basismonomial_coeffs(eqs::AbstractVector, pce::PCE)
     return basismonomial_coeffs, basismonomial_indices
 end
 
+function extract_basismonomial_coeffs(eqs::AbstractVector, pce::SparsePCE)
+    basismonomial_coeffs = [extract_coeffs(eq, pce.sym_basis) for eq in eqs]
+    basismonomial_indices = []
+    for coeffs in basismonomial_coeffs
+        temp = [mono => pce.pc_indices[get_basis_indices(mono) .+ 1] for mono in keys(coeffs)]
+        union!(basismonomial_indices, temp)
+    end
+    return basismonomial_coeffs, basismonomial_indices
+end
+
 # 3. compute inner products
-function maximum_degree(mono_indices::AbstractVector, pce::PCE)
+function maximum_degree(mono_indices::AbstractVector, pce::AbstractPCE)
     max_degree = 0
     for (mono, ind) in mono_indices
+        println(ind)
         max_degree = max(max_degree,
-                         maximum(sum(ind[i] * pce.pc_basis.ind[i + 1]
+                         maximum(sum(pce.pc_basis.ind[ind[i]+1, :]
                                      for i in eachindex(ind))))
     end
     return max_degree
@@ -223,14 +234,44 @@ function eval_scalar_products(mono_indices, pce::PCE)
     return scalar_products
 end
 
+function eval_scalar_products(mono_indices, pce::SparsePCE)
+    max_degree = maximum_degree(mono_indices, pce)
+    degree_quadrature = max(ceil(Int, 0.5 * (max_degree + deg(pce.pc_basis) + 1)),
+                            deg(pce.pc_basis))
+    integrator_pce = bump_degree(pce.pc_basis, degree_quadrature)
+
+    scalar_products = Dict()
+    for k in pce.pc_indices
+        scalar_products[k] = Dict(mono => computeSP(vcat(ind, kpc - 1), integrator_pce)
+                                  for (mono, ind) in mono_indices)
+    end
+    return scalar_products
+end
+
 # 4. Galerkin projection
 function galerkin_projection(bm_coeffs, scalar_products, pce::PCE)
     projected_eqs = []
+    scaling = computeSP2(pce.pc_basis)
     for i in eachindex(bm_coeffs)
         eqs = []
         for k in 1:dim(pce.pc_basis)
             push!(eqs,
-                  sum(bm_coeffs[i][mono] * scalar_products[k][mono]
+                  1/scaling[k] * sum(bm_coeffs[i][mono] * scalar_products[k][mono]
+                      for mono in keys(bm_coeffs[i])))
+        end
+        push!(projected_eqs, eqs)
+    end
+    return projected_eqs
+end
+
+function galerkin_projection(bm_coeffs, scalar_products, pce::SparsePCE)
+    projected_eqs = []
+    for i in eachindex(bm_coeffs)
+        eqs = []
+        for k in pce.sparse_pc_basis[i]
+            scaling = computeSP(vcat(k,k), pce.pc_basis)
+            push!(eqs,
+                  1/scaling * sum(bm_coeffs[i][mono] * scalar_products[k][mono]
                       for mono in keys(bm_coeffs[i])))
         end
         push!(projected_eqs, eqs)
@@ -239,21 +280,20 @@ function galerkin_projection(bm_coeffs, scalar_products, pce::PCE)
 end
 
 # 5. combine everything
-function pce_galerkin(eqs::AbstractVector, pce::PCE)
+function pce_galerkin(eqs::AbstractVector, pce::AbstractPCE)
     expanded_eqs = apply_ansatz(eqs, pce)
-    basismonomial_coeffs, basismonomial_indices = extract_basismonomial_coeffs(expanded_eqs,
-                                                                               pce)
-    scalar_products = eval_scalar_products(basismonomial_indices, pce)
-    projected_eqs = galerkin_projection(basismonomial_coeffs, scalar_products, pce)
+    basismono_coeffs, basismono_idcs = extract_basismonomial_coeffs(expanded_eqs, pce)
+    scalar_products = eval_scalar_products(basismono_idcs, pce)
+    projected_eqs = galerkin_projection(basismono_coeffs, scalar_products, pce)
     return projected_eqs
 end
 
 # 6. high-level interface
 # 6a. apply pce to explicit ODE
-function moment_equations(sys::ODESystem, pce::PCE)
+function moment_equations(sys::ODESystem, pce::AbstractPCE)
     eqs = [eq.rhs for eq in equations(sys)]
-    scaling_factors = computeSP2(pce.pc_basis)
-    moment_eqs = reduce(vcat, [eq ./ scaling_factors for eq in pce_galerkin(eqs, pce)])
+    moment_eqs = reduce(vcat, pce_galerkin(eqs, pce))
+   
     iv = independent_variable(sys)
     params = setdiff(parameters(sys), pce.parameters)
     D = Differential(iv)

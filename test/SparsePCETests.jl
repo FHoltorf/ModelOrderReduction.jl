@@ -1,5 +1,5 @@
 using ModelOrderReduction, ModelingToolkit, PolyChaos
-MO = ModelOrderReduction
+MOR = ModelOrderReduction
 
 @testset "SparsePCE: constructor test" begin
     @parameters a, b
@@ -8,8 +8,8 @@ MO = ModelOrderReduction
     ops = [Uniform01OrthoPoly(3), GaussOrthoPoly(2)]
     indices_x = [[0,0], [1,0], [2,1], [3,0]]
     indices_y = [[0,0], [0,2], [1,1]]
-    sp_pce = MO.SparsePCE([x => indices_x, y => indices_y],
-                          [a => ops[1], b => ops[2]])    
+    sp_pce = MOR.SparsePCE([x => indices_x, y => indices_y],
+                           [a => ops[1], b => ops[2]])    
 
     sparse_pc_indices = [[0,0],[1,0],[0,2],[1,1], [3,0], [2,1]]
     @test length(sp_pce.sym_basis) == 6
